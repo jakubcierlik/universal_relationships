@@ -1,0 +1,241 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  Sample blueprint from 'Universal Relationships' assignment.
+  Install 2 VMs: 
+    - in one installs a database
+    - in another installs a web application that is connected to the database.
+  Part 2: Using universal relationship plugin.
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5.0/types.yaml
+  - plugin:cloudify-openstack-plugin?version=2.14.7
+  - plugin:cloudify-utilities-plugin
+  - plugin:universal
+  - imports/cloud-config.yaml
+
+inputs:
+
+  webserver_port:
+    default: 8080
+
+  agent_key_private:
+    default: { get_secret: agent_key_private }
+
+  agent_key_public:
+    default: { get_secret: agent_key_public }
+
+  agent_user:
+    default: ubuntu
+
+  image:
+    type: string
+    default: { get_secret: ubuntu_trusty_image }
+
+  flavor:
+    default: '2'
+
+  manager_network:
+    default: external
+
+  network_deployment_name:
+    default: openstack-app-db-intrinsic
+
+  use_existing_network_deployment:
+    default: true
+
+dsl_definitions:
+
+  openstack_config: &openstack_config
+    username: { get_secret: keystone_username }
+    password: { get_secret: keystone_password }
+    tenant_name: { get_secret: keystone_tenant_name }
+    auth_url: { get_secret: keystone_url }
+    region: { get_secret: keystone_region }
+
+node_templates:
+
+  http_web_server:
+    type: cloudify.nodes.WebServer
+    properties:
+      port: { get_input: webserver_port }
+      requirements:
+        db_ip: conn_ip
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+      - type: universal.connected-to
+        target: database
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: scripts/configure.sh
+        start: scripts/start.sh
+        stop: scripts/stop.sh
+
+  host:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *openstack_config
+      agent_config:
+        network: { get_input: manager_network }
+        user: { get_input: agent_user }
+        install_method: init_script
+        port: 22
+        key: { get_input: agent_key_private }
+      server:
+        meta:
+          blueprint_version: v1
+        key_name: ''
+        image: { get_input: image }
+        flavor: { get_input: flavor }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: openstack.nova_plugin.server.create
+          inputs:
+            args:
+              meta:
+                blueprint_version: v1
+              image: { get_input: image }
+              flavor: { get_input: flavor }
+              userdata: { get_attribute: [ cloudify_host_cloud_config, cloud_config ] }
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: public_network
+    - type: cloudify.openstack.server_connected_to_port
+      target: port
+    - type: cloudify.relationships.depends_on
+      target: cloudify_host_cloud_config
+
+  port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: public_network
+    - type: cloudify.relationships.depends_on
+      target: public_subnet
+    - type: cloudify.openstack.port_connected_to_floating_ip
+      target: ip
+
+  public_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_attribute: [ openstack, deployment, outputs, public_subnet ] }
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: public_network
+
+  public_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_attribute: [ openstack, deployment, outputs, public_network ] }
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: openstack
+
+  cloudify_host_cloud_config:
+    type: cloudify.nodes.CloudInit.CloudConfig
+    properties:
+      resource_config:
+        manage_etc_hosts: True
+        users:
+          - name: { get_input: agent_user }
+            shell: /bin/bash
+            sudo: ['ALL=(ALL) NOPASSWD:ALL']
+            ssh-authorized-keys:
+              - { get_input: agent_key_public }
+
+  openstack:
+    type: cloudify.nodes.DeploymentProxy
+    properties:
+      resource_config:
+        blueprint:
+          id: { get_input: network_deployment_name }
+          blueprint_archive: https://github.com/cloudify-examples/openstack-example-network/archive/master.zip
+          main_file_name: simple-blueprint.yaml
+          external_resource: { get_input: use_existing_network_deployment }
+        deployment:
+          id: { get_input: network_deployment_name }
+          outputs:
+            external_network: external_network
+            public_network_router: public_network_router
+            public_network: public_network
+            private_network: private_network
+            public_subnet: public_subnet
+            private_subnet: private_subnet
+          external_resource:
+            get_input: use_existing_network_deployment
+        reexecute: false
+
+  database:
+    type: cloudify.nodes.DBMS
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/create.py
+        configure:
+          implementation: scripts/configure.py
+          inputs:
+            mysql_commands: { get_input: mysql_commands }
+        start:
+          implementation: scripts/start.py
+          inputs:
+            cluster_addresses:
+              get_attribute: [ cluster, cluster_addresses ]
+            master: 
+              get_attribute: [ cluster, master ]
+    properties:
+      capabilities:
+        db_ip: ip
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: host
+    - type: cloudify.relationships.depends_on
+      target: cluster
+      source_interfaces:
+        cloudify.interfaces.relationship_lifecycle:
+          postconfigure:
+            implementation: scripts/cluster.py
+      properties:
+        connection_type: all_to_one
+
+  cluster:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/cluster.py
+          executor: central_deployment_agent
+    relationships:
+    - type: cloudify.relationships.depends_on
+      target: host
+      properties:
+        connection_type: all_to_all
+    - type: cloudify.relationships.depends_on
+      target: db_requirements
+
+plugins:
+
+  connected_to:
+    executor: host_agent
+    source: connected-to
+    package_name: 'universal'
+    package_version: '0.1'
+
+outputs:
+
+  application_endpoint:
+    description: The external endpoint of the application.
+    value: 
+      concat: 
+      - 'http://'
+      - { get_attribute: [http_web_server, ip] }
+      - ':'
+      - { get_input: webserver_port }
+      - '/'
